@@ -1,0 +1,206 @@
+# Picard, the next-generation MusicBrainz tagger
+#
+# Copyright (C) 2011-2012 Lukáš Lalinský
+# Copyright (C) 2011-2013 Michael Wiencek
+# Copyright (C) 2013, 2018, 2020-2026 Laurent Monin
+# Copyright (C) 2015, 2020-2023, 2025-2026 Philipp Wolfer
+# Copyright (C) 2016-2017 Sambhav Kothari
+# Copyright (C) 2023, 2026 Bob Swift
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+
+import os
+from typing import ClassVar
+
+from PyQt6 import (
+    QtCore,
+    QtGui,
+    QtWidgets,
+)
+
+from picard import log
+from picard.acoustid import find_fpcalc
+from picard.config import get_config
+from picard.extension_points.options_pages import register_options_page
+from picard.i18n import (
+    N_,
+    gettext as _,
+)
+from picard.util import (
+    resolve_fs_path,
+    webbrowser2,
+)
+
+from picard.ui.colors import (
+    stylesheet_validation_error,
+    stylesheet_validation_success,
+)
+from picard.ui.forms.ui_options_fingerprinting import (
+    Ui_FingerprintingOptionsPage,
+)
+from picard.ui.options import (
+    OptionsCheckError,
+    OptionsPage,
+    PageOptionConfigs,
+)
+from picard.ui.util import FileDialog
+
+
+class ApiKeyValidator(QtGui.QValidator):
+    def validate(self, input, pos):
+        # Strip whitespace to avoid typical copy and paste user errors
+        return (QtGui.QValidator.State.Acceptable, input.strip(), pos)
+
+
+class FingerprintingOptionsPage(OptionsPage):
+    NAME = 'fingerprinting'
+    TITLE = N_("Fingerprinting")
+    PARENT = 'lookup'
+    SORT_ORDER = 15
+    ACTIVE = True
+    HELP_URL = "/config/options_fingerprinting.html"
+
+    OPTIONS: ClassVar[PageOptionConfigs] = {
+        'fingerprinting_system': {'widgets': ['disable_fingerprinting', 'use_acoustid']},
+        'acoustid_fpcalc': {},
+        'acoustid_apikey': {},
+        'ignore_existing_acoustid_fingerprints': {'widgets': ['ignore_existing_acoustid_fingerprints']},
+        'save_acoustid_fingerprints': {'widgets': ['save_acoustid_fingerprints']},
+        'fpcalc_threads': {},
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self._fpcalc_valid = True
+        self._fpcalc_checking = False
+        self.ui = Ui_FingerprintingOptionsPage()
+        self.ui.setupUi(self)
+        self.apply_option_bounds(self.ui.fpcalc_threads, 'fpcalc_threads')
+
+        # Set open directory icon on folder browse button
+        icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon)
+        self.ui.acoustid_fpcalc_browse.setIcon(icon)
+
+        self.ui.disable_fingerprinting.clicked.connect(self.update_groupboxes)
+        self.ui.use_acoustid.clicked.connect(self.update_groupboxes)
+        self.ui.acoustid_fpcalc.textChanged.connect(self._acoustid_fpcalc_check)
+        self.ui.acoustid_fpcalc_browse.clicked.connect(self.acoustid_fpcalc_browse)
+        self.ui.acoustid_fpcalc_download.clicked.connect(self.acoustid_fpcalc_download)
+        self.ui.acoustid_apikey_get.clicked.connect(self.acoustid_apikey_get)
+        self.ui.acoustid_apikey.setValidator(ApiKeyValidator())
+
+    def load(self):
+        config = get_config()
+        if config.setting['fingerprinting_system'] == 'acoustid':
+            self.ui.use_acoustid.setChecked(True)
+        else:
+            self.ui.disable_fingerprinting.setChecked(True)
+        self.ui.acoustid_fpcalc.setPlaceholderText(find_fpcalc())
+        self.ui.acoustid_fpcalc.setText(config.setting['acoustid_fpcalc'])
+        self.ui.acoustid_apikey.setText(config.setting['acoustid_apikey'])
+        self.ui.ignore_existing_acoustid_fingerprints.setChecked(
+            config.setting['ignore_existing_acoustid_fingerprints']
+        )
+        self.ui.save_acoustid_fingerprints.setChecked(config.setting['save_acoustid_fingerprints'])
+        self.ui.fpcalc_threads.setValue(config.setting['fpcalc_threads'])
+        self.update_groupboxes()
+
+    def save(self):
+        config = get_config()
+        if self.ui.use_acoustid.isChecked():
+            config.setting['fingerprinting_system'] = 'acoustid'
+        else:
+            config.setting['fingerprinting_system'] = ''
+        config.setting['acoustid_fpcalc'] = self.ui.acoustid_fpcalc.text()
+        config.setting['acoustid_apikey'] = self.ui.acoustid_apikey.text()
+        config.setting['ignore_existing_acoustid_fingerprints'] = (
+            self.ui.ignore_existing_acoustid_fingerprints.isChecked()
+        )
+        config.setting['save_acoustid_fingerprints'] = self.ui.save_acoustid_fingerprints.isChecked()
+        config.setting['fpcalc_threads'] = self.ui.fpcalc_threads.value()
+
+    def update_groupboxes(self):
+        if self.ui.use_acoustid.isChecked():
+            self.ui.acoustid_settings.setEnabled(True)
+        else:
+            self.ui.acoustid_settings.setEnabled(False)
+        self._acoustid_fpcalc_check()
+
+    def acoustid_fpcalc_browse(self):
+        path, _filter = FileDialog.getOpenFileName(
+            parent=self,
+            directory=self.ui.acoustid_fpcalc.text(),
+        )
+        if path:
+            path = resolve_fs_path(os.path.normpath(path))
+            self.ui.acoustid_fpcalc.setText(path)
+
+    def acoustid_fpcalc_download(self):
+        webbrowser2.open('chromaprint')
+
+    def acoustid_apikey_get(self):
+        webbrowser2.open('acoustid_apikey')
+
+    def _acoustid_fpcalc_check(self):
+        if not self.ui.use_acoustid.isChecked():
+            self._acoustid_fpcalc_set_success("")
+            return
+        fpcalc = self.ui.acoustid_fpcalc.text()
+        if not fpcalc:
+            fpcalc = find_fpcalc()
+        self._fpcalc_valid = False
+        self._fpcalc_checking = True
+        process = QtCore.QProcess(self)
+        process.finished.connect(self._on_acoustid_fpcalc_check_finished)
+        process.errorOccurred.connect(self._on_acoustid_fpcalc_check_error)
+        process.start(fpcalc, ["-v"])
+
+    def _on_acoustid_fpcalc_check_finished(self, exit_code: int, exit_status: QtCore.QProcess.ExitStatus):
+        process = self.sender()
+        if exit_code == 0 and exit_status == QtCore.QProcess.ExitStatus.NormalExit:
+            output = bytes(process.readAllStandardOutput()).decode()
+            if output.startswith("fpcalc version"):
+                self._acoustid_fpcalc_set_success(output.strip())
+            else:
+                first_line = output.split('\n')[0]
+                self._acoustid_fpcalc_set_error(f'unexpected output "{first_line}"')
+        else:
+            self._acoustid_fpcalc_set_error(f'exit status {exit_status.name}, exit code {exit_code}')
+
+    def _on_acoustid_fpcalc_check_error(self, error: QtCore.QProcess.ProcessError):
+        self._acoustid_fpcalc_set_error(f'process failed ({error.name})')
+
+    def _acoustid_fpcalc_set_success(self, version):
+        self._fpcalc_valid = True
+        self._fpcalc_checking = False
+        self.ui.acoustid_fpcalc_info.setStyleSheet(stylesheet_validation_success())
+        self.ui.acoustid_fpcalc_info.setText(version)
+
+    def _acoustid_fpcalc_set_error(self, msg):
+        log.warning('fpcalc error: %s', msg)
+        self._fpcalc_valid = False
+        self._fpcalc_checking = False
+        self.ui.acoustid_fpcalc_info.setStyleSheet(stylesheet_validation_error())
+        self.ui.acoustid_fpcalc_info.setText(_("Please select a valid fpcalc executable."))
+
+    def check(self):
+        if not self._fpcalc_valid and not self._fpcalc_checking:
+            raise OptionsCheckError(_("Invalid fpcalc executable"), _("Please select a valid fpcalc executable."))
+
+    def display_error(self, error):
+        pass
+
+
+register_options_page(FingerprintingOptionsPage)
