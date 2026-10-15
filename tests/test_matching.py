@@ -1,0 +1,734 @@
+# Picard, the next-generation MusicBrainz tagger
+#
+# Copyright (C) 2017 Sophist-UK
+# Copyright (C) 2018, 2020 Wieland Hoffmann
+# Copyright (C) 2018-2021, 2023, 2026 Philipp Wolfer
+# Copyright (C) 2018-2024, 2026 Laurent Monin
+# Copyright (C) 2020 dukeyin
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+
+from collections import namedtuple
+
+from test.picardtestcase import (
+    PicardTestCase,
+    load_test_json,
+)
+
+from picard.acoustid.json_helpers import (
+    parse_recording as acoustid_parse_recording,
+)
+from picard.cluster import CLUSTER_COMPARISON_WEIGHTS
+from picard.const import VARIOUS_ARTISTS_ID
+from picard.file import FILE_COMPARISON_WEIGHTS
+from picard.matching import (
+    _SKIP_RELEASE_WEIGHT,
+    ReleaseMatchParts,
+    SimMatchRelease,
+    _catno_label_score,
+    _catno_similarity,
+    _compare_to_release_parts,
+    _date_score,
+    _format_sim_breakdown,
+    _get_weighted_release_parts,
+    _is_various_artists,
+    _isrcs_score,
+    _trackcount_score,
+    _weights_from_preferred_countries,
+    _weights_from_preferred_formats,
+    _weights_from_preferred_release_types,
+    compare_to_release,
+    compare_to_track,
+    find_best_match,
+    find_best_match_with_margin,
+    length_score,
+    sort_by_similarity,
+)
+from picard.mbjson import (
+    release_to_metadata,
+    track_to_metadata,
+)
+from picard.metadata import Metadata
+from picard.options import StandardizeArtistNames
+from picard.track import Track
+
+
+settings = {
+    'write_id3v23': False,
+    'id3v23_join_with': '/',
+    'preferred_release_countries': [],
+    'preferred_release_formats': [],
+    'preferred_release_types': ['Album', 'Other'],
+    'discouraged_release_types': [],
+    "standardize_artist_names": StandardizeArtistNames.NONE,
+    'standardize_instruments': False,
+    'standardize_vocals': False,
+    'translate_artist_names': False,
+    'release_ars': True,
+    'va_name': 'Various Artists',
+}
+
+
+class CompareToReleaseTest(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch_tagger_instance('picard.item')
+        self.set_config_values(settings)
+
+    def test_compare_to_release(self):
+        release = load_test_json('release.json')
+        metadata = Metadata()
+        release_to_metadata(release, metadata)
+        match_ = compare_to_release(metadata, release, CLUSTER_COMPARISON_WEIGHTS)
+        self.assertEqual(1.0, match_.similarity)
+        self.assertEqual(release, match_.release)
+
+    def test_compare_to_release_with_score(self):
+        release = load_test_json('release.json')
+        metadata = Metadata()
+        release_to_metadata(release, metadata)
+        for score, sim in ((42, 0.42), ('42', 0.42), ('foo', 1.0), (None, 1.0)):
+            release['score'] = score
+            match_ = compare_to_release(metadata, release, CLUSTER_COMPARISON_WEIGHTS)
+            self.assertEqual(sim, match_.similarity)
+
+    def test_compare_to_release_similarity_breakdown(self):
+        # The debug-only base_similarity field must be populated; the final
+        # similarity is base_similarity * get_score(). This separates the
+        # intrinsic field comparison from the search-relevance multiplier.
+        release = load_test_json('release.json')
+        metadata = Metadata()
+        release_to_metadata(release, metadata)
+        for score, expected_mult in ((42, 0.42), ('42', 0.42), ('foo', 1.0), (None, 1.0)):
+            release['score'] = score
+            match_ = compare_to_release(metadata, release, CLUSTER_COMPARISON_WEIGHTS)
+            self.assertIsNotNone(match_.base_similarity)
+            self.assertAlmostEqual(match_.similarity, match_.base_similarity * expected_mult)
+
+    def test_compare_to_release_parts_totaltracks(self):
+        release = load_test_json('release_multidisc.json')
+        metadata = Metadata()
+        weights = {"similarity": {"totaltracks": 30}}
+        release_to_metadata(release, metadata)
+        # Release has media with track counts [4, 3]
+        for totaltracks, sim in ((4, 1.0), (3, 1.0), (2, 1 / 3), (5, 0.25)):
+            metadata['totaltracks'] = totaltracks
+            parts = _compare_to_release_parts(metadata, release, weights)
+            self.assertAlmostEqual(parts.similarity[0][0], sim, places=5)
+            self.assertEqual(parts.similarity[0][1], 30)
+
+    def test_compare_to_release_parts_totalalbumtracks(self):
+        release = load_test_json('release_multidisc.json')
+        metadata = Metadata()
+        weights = {"similarity": {"totalalbumtracks": 30}}
+        release_to_metadata(release, metadata)
+        for totaltracks, sim in ((7, 1.0), (6, 5 / 7), (8, 4 / 7)):
+            metadata['~totalalbumtracks'] = totaltracks
+            parts = _compare_to_release_parts(metadata, release, weights)
+            self.assertAlmostEqual(parts.similarity[0][0], sim, places=5)
+            self.assertEqual(parts.similarity[0][1], 30)
+
+    def test_compare_to_release_parts_totalalbumtracks_totaltracks_fallback(self):
+        release = load_test_json('release_multidisc.json')
+        metadata = Metadata()
+        weights = {"similarity": {"totalalbumtracks": 30}}
+        release_to_metadata(release, metadata)
+        for totaltracks, sim in ((7, 1.0), (6, 5 / 7), (8, 4 / 7)):
+            metadata['totaltracks'] = totaltracks
+            parts = _compare_to_release_parts(metadata, release, weights)
+            self.assertAlmostEqual(parts.similarity[0][0], sim, places=5)
+            self.assertEqual(parts.similarity[0][1], 30)
+
+    def test_compare_to_release_parts_barcode_match(self):
+        release = load_test_json('release.json')
+        metadata = Metadata()
+        weights = {"identifiers": {"barcode": 6}}
+        metadata['barcode'] = '123'
+        parts = _compare_to_release_parts(metadata, release, weights)
+        self.assertIn((1.0, 6), parts.identifiers)
+
+    def test_compare_to_release_parts_barcode_mismatch(self):
+        release = load_test_json('release.json')
+        metadata = Metadata()
+        weights = {"identifiers": {"barcode": 6}}
+        metadata['barcode'] = '999'
+        parts = _compare_to_release_parts(metadata, release, weights)
+        self.assertIn((0.0, 6), parts.identifiers)
+
+    def test_compare_to_release_parts_barcode_no_release_barcode(self):
+        release = load_test_json('release.json')
+        release['barcode'] = ''
+        metadata = Metadata()
+        weights = {"identifiers": {"barcode": 6}}
+        metadata['barcode'] = '123'
+        parts = _compare_to_release_parts(metadata, release, weights)
+        self.assertIn((0.0, 6), parts.identifiers)
+
+    def test_compare_to_release_parts_barcode_no_file_barcode(self):
+        release = load_test_json('release.json')
+        metadata = Metadata()
+        weights = {"identifiers": {"barcode": 6}}
+        parts = _compare_to_release_parts(metadata, release, weights)
+        self.assertFalse(parts.identifiers)
+
+    def test_compare_to_release_parts_barcode_upc_ean_normalization(self):
+        release = load_test_json('release.json')
+        release['barcode'] = '0727361379704'
+        metadata = Metadata()
+        weights = {"identifiers": {"barcode": 6}}
+        metadata['barcode'] = '727361379704'
+        parts = _compare_to_release_parts(metadata, release, weights)
+        self.assertIn((1.0, 6), parts.identifiers)
+
+    def test_barcode_breaks_tie_between_identical_releases(self):
+        release_with_barcode = load_test_json('release.json')
+        release_without_barcode = load_test_json('release.json')
+        release_without_barcode['barcode'] = ''
+        release_without_barcode['id'] = 'different-id'
+        metadata = Metadata()
+        release_to_metadata(release_with_barcode, metadata)
+        match_with = compare_to_release(metadata, release_with_barcode, CLUSTER_COMPARISON_WEIGHTS)
+        match_without = compare_to_release(metadata, release_without_barcode, CLUSTER_COMPARISON_WEIGHTS)
+        self.assertGreater(match_with.similarity, match_without.similarity)
+
+    def _release(self, title, artist, ntracks):
+        return {
+            'title': title,
+            'artist-credit': [{'name': artist, 'artist': {'name': artist, 'sort-name': artist}}],
+            'media': [{'track-count': ntracks, 'tracks': [{} for _ in range(ntracks)]}],
+            'track-count': ntracks,
+        }
+
+    def test_discriminator_penalty_wrong_artist_matching_tracks(self):
+        """Same title + same track count but a different artist is penalized.
+
+        A matching album title (and a coincidentally equal track count) must not
+        carry a match when the artist clearly contradicts.
+        """
+        weights = {"similarity": {"album": 17, "albumartist": 6, "totalalbumtracks": 5}}
+        metadata = Metadata({'album': 'World of Illusions', 'albumartist': 'Kachkin', '~totalalbumtracks': '12'})
+        collision = self._release('World of Illusions', 'NanoStorm', 12)  # same title + tracks, other artist
+        correct = self._release('World of Illusions', 'Kachkin', 12)
+        parts_collision = _compare_to_release_parts(metadata, collision, weights)
+        parts_correct = _compare_to_release_parts(metadata, correct, weights)
+        self.assertLess(parts_collision.discriminator_penalty, 1.0)
+        self.assertEqual(parts_correct.discriminator_penalty, 1.0)
+        self.assertGreater(parts_correct.combine_tiers(), parts_collision.combine_tiers())
+
+    def test_discriminator_penalty_not_applied_to_same_artist_edition(self):
+        """Same title + same artist but a different track count is NOT penalized.
+
+        A different track count alone (e.g. a deluxe/bonus-track edition by the
+        same artist) is a legitimate alternate edition, not a wrong album.
+        """
+        weights = {"similarity": {"album": 17, "albumartist": 6, "totalalbumtracks": 5}}
+        metadata = Metadata({'album': 'World of Illusions', 'albumartist': 'Kachkin', '~totalalbumtracks': '12'})
+        edition = self._release('World of Illusions', 'Kachkin', 9)  # same artist, fewer tracks
+        parts = _compare_to_release_parts(metadata, edition, weights)
+        self.assertEqual(parts.discriminator_penalty, 1.0)
+
+    def test_discriminator_penalty_not_applied_to_swapped_tags(self):
+        """Swapped artist/album tags are not penalized (the title does not match)."""
+        weights = {"similarity": {"album": 17, "albumartist": 6, "totalalbumtracks": 5}}
+        # File has artist and album swapped: album tag holds the artist name.
+        metadata = Metadata({'album': 'Kachkin', 'albumartist': 'World of Illusions', '~totalalbumtracks': '12'})
+        correct = self._release('World of Illusions', 'Kachkin', 12)
+        parts = _compare_to_release_parts(metadata, correct, weights)
+        self.assertEqual(parts.discriminator_penalty, 1.0)
+
+    def test_discriminator_penalty_not_applied_to_various_artists(self):
+        """A Various Artists compilation is exempt from the artist penalty.
+
+        Its album artist legitimately differs from any single release artist, so
+        a low artist similarity must not be penalized. Common VA conventions and
+        the configured va_name are all recognised.
+        """
+        weights = {"similarity": {"album": 17, "albumartist": 6, "totalalbumtracks": 5}}
+        release = self._release('Summer Hits', 'Some Artist', 20)
+        for va in ('Various Artists', 'various artists', 'VA', 'Various'):
+            metadata = Metadata({'album': 'Summer Hits', 'albumartist': va, '~totalalbumtracks': '20'})
+            parts = _compare_to_release_parts(metadata, release, weights)
+            self.assertEqual(parts.discriminator_penalty, 1.0, msg='albumartist=%r' % va)
+
+
+class CompareToTrackTest(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch_tagger_instance('picard.item')
+        self.set_config_values(settings)
+
+    def test_compare_to_track(self):
+        track_json = load_test_json('track.json')
+        track = Track(track_json['id'])
+        track_to_metadata(track_json, track)
+        match_ = compare_to_track(track.metadata, track_json, FILE_COMPARISON_WEIGHTS)
+        self.assertGreaterEqual(match_.similarity, 0.7)
+        self.assertEqual(track_json, match_.track)
+
+    def test_compare_to_track_with_score(self):
+        track_json = load_test_json('track.json')
+        track = Track(track_json['id'])
+        track_to_metadata(track_json, track)
+        for score in (42, '42', 'foo', None):
+            track_json['score'] = score
+            match_ = compare_to_track(track.metadata, track_json, FILE_COMPARISON_WEIGHTS)
+            # Score 42 → 0.42 multiplier; 'foo'/None → treated as 1.0
+            if score in {42, '42'}:
+                self.assertLess(match_.similarity, 0.5)
+            else:
+                self.assertGreater(match_.similarity, 0.5)
+
+    def test_compare_to_track_similarity_breakdown(self):
+        # base_similarity must be populated; similarity is base_similarity *
+        # get_score() for the release-bearing path.
+        track_json = load_test_json('track.json')
+        track = Track(track_json['id'])
+        track_to_metadata(track_json, track)
+        for score, expected_mult in ((42, 0.42), ('42', 0.42), ('foo', 1.0), (None, 1.0)):
+            track_json['score'] = score
+            match_ = compare_to_track(track.metadata, track_json, FILE_COMPARISON_WEIGHTS)
+            self.assertIsNotNone(match_.base_similarity)
+            self.assertAlmostEqual(match_.similarity, match_.base_similarity * expected_mult)
+
+    def test_compare_to_track_is_video(self):
+        recording = load_test_json('recording_video_null.json')
+        m = Metadata()
+        match_ = compare_to_track(m, recording, {'preferences': {'isvideo': 1}})
+        self.assertEqual(1.0, match_.similarity)
+        m['~video'] = '1'
+        match_ = compare_to_track(m, recording, {'preferences': {'isvideo': 1}})
+        self.assertEqual(0.0, match_.similarity)
+        recording['video'] = True
+        match_ = compare_to_track(m, recording, {'preferences': {'isvideo': 1}})
+        self.assertEqual(1.0, match_.similarity)
+
+    def test_compare_to_track_full(self):
+        recording = load_test_json('recording_video_null.json')
+        m = Metadata(
+            {
+                'artist': 'Tim Green',
+                'release': 'Eastbound Silhouette',
+                'date': '2022',
+                'title': 'Lune',
+                'totaltracks': '6',
+                'albumartist': 'Tim Green',
+                'tracknumber': '4',
+            }
+        )
+        match_ = compare_to_track(m, recording, FILE_COMPARISON_WEIGHTS)
+        self.assertGreaterEqual(match_.similarity, 0.8)
+        self.assertEqual(recording, match_.track)
+        self.assertEqual(recording['releases'][0], match_.release)
+
+    def test_compare_to_track_without_releases(self):
+        self.set_config_values(
+            {
+                'preferred_release_types': ['Compilation', 'Other'],
+                'discouraged_release_types': [],
+            }
+        )
+        track_json = acoustid_parse_recording(load_test_json('acoustid.json'))
+        track = Track(track_json['id'])
+        track.metadata.update(
+            {
+                'album': 'x',
+                'artist': 'Ed Sheeran',
+                'title': 'Nina',
+            }
+        )
+        track.metadata.length = 225000
+        m1 = compare_to_track(track.metadata, track_json, FILE_COMPARISON_WEIGHTS)
+        del track_json['releases']
+        m2 = compare_to_track(track.metadata, track_json, FILE_COMPARISON_WEIGHTS)
+        self.assertGreater(
+            m1.similarity,
+            m2.similarity,
+            'Matching score for release with recordings must be higher then for release without',
+        )
+        # Both the release-bearing (m1) and no-releases (m2) paths must expose
+        # the base_similarity breakdown.
+        for m in (m1, m2):
+            self.assertIsNotNone(m.base_similarity)
+
+
+class ReleaseMatchPartsTest(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch_tagger_instance('picard.item')
+
+    def test_combine_tiers_no_identifiers(self):
+        """Without identifiers, similarity drives the score."""
+        parts = ReleaseMatchParts(
+            similarity=[(1.0, 10), (1.0, 5)],
+            preferences=[(1.0, 2)],
+        )
+        # sim=1.0, pref=1.0 → 1.0*0.9 + 1.0*0.1 = 1.0
+        self.assertAlmostEqual(1.0, parts.combine_tiers())
+
+    def test_combine_tiers_strong_identifier_match(self):
+        """Strong identifier match → high score, similarity still contributes."""
+        parts = ReleaseMatchParts(
+            identifiers=[(1.0, 28)],
+            similarity=[(0.5, 10)],  # mediocre similarity
+            preferences=[(0.0, 2)],  # worst preference
+        )
+        # id≥0.9 → 0.85 + 0.5*0.1 + 0.0*0.05 = 0.9
+        self.assertAlmostEqual(0.9, parts.combine_tiers())
+
+    def test_combine_tiers_strong_identifier_mismatch(self):
+        """Strong identifier mismatch → score capped low."""
+        parts = ReleaseMatchParts(
+            identifiers=[(0.0, 28)],
+            similarity=[(1.0, 10), (1.0, 5)],  # perfect similarity
+            preferences=[(1.0, 2)],
+        )
+        # id≤0.1 → min(0.3, 1.0*0.3) = 0.3
+        self.assertAlmostEqual(0.3, parts.combine_tiers())
+
+    def test_combine_tiers_partial_identifier(self):
+        """Partial identifier signal → blend all tiers."""
+        parts = ReleaseMatchParts(
+            identifiers=[(0.5, 28)],
+            similarity=[(1.0, 10)],
+            preferences=[(1.0, 2)],
+        )
+        # 0.5*0.4 + 1.0*0.5 + 1.0*0.1 = 0.8
+        self.assertAlmostEqual(0.8, parts.combine_tiers())
+
+    def test_combine_tiers_identifier_overrides_preference(self):
+        """Barcode match wins over format preference mismatch."""
+        # Release A: barcode matches, bad preference
+        parts_a = ReleaseMatchParts(
+            identifiers=[(1.0, 28)],
+            similarity=[(0.8, 10)],
+            preferences=[(0.0, 2)],
+        )
+        # Release B: no barcode, good preference
+        parts_b = ReleaseMatchParts(
+            similarity=[(0.8, 10)],
+            preferences=[(1.0, 2)],
+        )
+        self.assertGreater(parts_a.combine_tiers(), parts_b.combine_tiers())
+
+    def test_combine_tiers_discriminator_penalty(self):
+        """A matching title cannot carry a wrong artist + wrong tracklist.
+
+        discriminator_penalty halves the similarity tier, so a title-only match
+        (e.g. a same-title release by a different artist with a different track
+        count) scores far below the same parts without the penalty.
+        """
+        sim = [(1.0, 17), (0.08, 6), (0.0, 5)]  # album match, artist/tracks mismatch
+        no_penalty = ReleaseMatchParts(similarity=sim)
+        with_penalty = ReleaseMatchParts(similarity=sim, discriminator_penalty=0.5)
+        self.assertLess(with_penalty.combine_tiers(), no_penalty.combine_tiers())
+        # No identifiers → score is sim_score*0.9 + 0.5*0.1; penalty halves sim_score.
+        sim_score = (1.0 * 17 + 0.08 * 6 + 0.0 * 5) / 28
+        self.assertAlmostEqual(with_penalty.combine_tiers(), sim_score * 0.5 * 0.9 + 0.5 * 0.1, places=4)
+
+
+class ScoreHelpersTest(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch_tagger_instance('picard.item')
+
+    def test_length_score(self):
+        results = (
+            (20000, 0, 0.333333333333),
+            (20000, 10000, 0.666666666667),
+            (20000, 20000, 1.0),
+            (20000, 30000, 0.666666666667),
+            (20000, 40000, 0.333333333333),
+            (20000, 50000, 0.0),
+            (20000, None, 0.0),
+            (None, 2000, 0.0),
+            (None, None, 0.0),
+        )
+        for a, b, expected in results:
+            actual = length_score(a, b)
+            self.assertAlmostEqual(
+                expected,
+                actual,
+                msg="a={a}, b={b}".format(a=a, b=b),
+            )
+
+    def test_date_score(self):
+        self.assertEqual(0.25, _date_score({}, Metadata()))
+        self.assertEqual(0.65, _date_score({'date': '2026'}, Metadata()))
+        self.assertEqual(1.0, _date_score({'date': '2026-05-21'}, Metadata({'date': '2026-05-21'})))
+        self.assertEqual(0.0, _date_score({'date': 'invalid'}, Metadata({'date': '2026-05-21'})))
+        self.assertEqual(0.0, _date_score({'date': '2026-05-21'}, Metadata({'date': 'invalid'})))
+        self.assertEqual(0.95, _date_score({'date': '2026-05-21'}, Metadata({'date': '2026-08-30'})))
+        self.assertEqual(0.85, _date_score({'date': '2026-05-21'}, Metadata({'date': '2024-08-30'})))
+        self.assertEqual(0.0, _date_score({'date': '2026-05-21'}, Metadata({'date': '2023-08-30'})))
+
+    def test_catno_label_score(self):
+        self.assertEqual(0.5, _catno_label_score('R-123', 'Foo', []))
+        self.assertEqual(1.0, _catno_label_score('R-123', 'Foo', [{'catalog-number': 'R-123'}]))
+        self.assertEqual(1.0, _catno_label_score('R-123', 'Foo', [{'catalog-number': 'r-123'}]))
+        self.assertEqual(
+            1.0, _catno_label_score('R-123', 'Foo', [{'catalog-number': '456'}, {'catalog-number': 'R-123'}])
+        )
+        self.assertEqual(
+            1.0, _catno_label_score('R-123', 'Foo', [{'catalog-number': 'R-123', 'label': {'name': 'Foo'}}])
+        )
+        self.assertEqual(1.0, _catno_label_score('R-123', '', [{'catalog-number': 'R-123', 'label': {'name': 'Foo'}}]))
+        self.assertEqual(
+            0.8, _catno_label_score('R-123', 'Foo', [{'catalog-number': 'R-123', 'label': {'name': 'Bar'}}])
+        )
+        self.assertEqual(
+            0.0, _catno_label_score('R-456', 'Foo', [{'catalog-number': 'R-123', 'label': {'name': 'Foo'}}])
+        )
+        # "[none]" placeholders are ignored on both sides (PICARD / PR #3478).
+        self.assertEqual(
+            0.5, _catno_label_score('R-123', 'Foo', [{'catalog-number': '[none]', 'label': {'name': '[no label]'}}])
+        )
+        self.assertEqual(0.5, _catno_label_score('R-123', 'Foo', [{'catalog-number': '[NONE]'}]))
+        self.assertEqual(0.5, _catno_label_score('[none]', 'Foo', [{'catalog-number': 'R-123'}]))
+        self.assertEqual(0.5, _catno_label_score('R-123', 'Foo', [{'label': {'name': 'Foo'}}]))
+        # A real catno alongside a placeholder still matches.
+        self.assertEqual(
+            1.0, _catno_label_score('R-123', 'Foo', [{'catalog-number': '[none]'}, {'catalog-number': 'R-123'}])
+        )
+        # Near-miss (typo / differing separator) earns partial credit, capped at 0.75.
+        self.assertEqual(0.75, _catno_label_score('DGCD-24629', 'Foo', [{'catalog-number': 'DGCD-04629'}]))
+        self.assertGreater(_catno_label_score('DGCD-24629', 'Foo', [{'catalog-number': 'DGCD 24629'}]), 0.6)
+        self.assertGreater(_catno_label_score('KRANK 043', 'Foo', [{'catalog-number': 'KRANK043'}]), 0.6)
+        # A genuinely different catno stays a hard mismatch.
+        self.assertEqual(0.0, _catno_label_score('Day 07', 'Foo', [{'catalog-number': 'DGCD-24629'}]))
+        # Ordering: exact match > near-miss typo > genuinely different.
+        self.assertGreater(
+            _catno_label_score('DGCD-24629', 'Foo', [{'catalog-number': 'DGCD-24629'}]),
+            _catno_label_score('DGCD-24629', 'Foo', [{'catalog-number': 'DGCD-04629'}]),
+        )
+        self.assertGreater(
+            _catno_label_score('DGCD-24629', 'Foo', [{'catalog-number': 'DGCD-04629'}]),
+            _catno_label_score('DGCD-24629', 'Foo', [{'catalog-number': 'ZZZZ-99999'}]),
+        )
+
+    def test_catno_similarity(self):
+        # Case/separator differences and one-character typos score high.
+        self.assertGreater(_catno_similarity('DGCD-24629', 'dgcd 24629'), 0.6)
+        self.assertGreater(_catno_similarity('KRANK 043', 'KRANK043'), 0.6)
+        self.assertGreater(_catno_similarity('DGCD-24629', 'DGCD-04629'), 0.6)
+        self.assertGreater(_catno_similarity('Day 07', 'Dey 07'), 0.6)
+        # Genuinely different catalog numbers score low.
+        self.assertLess(_catno_similarity('Day 07', 'DGCD-24629'), 0.6)
+        # Unicode is preserved, not stripped (a CJK/symbol typo stays similar).
+        self.assertGreater(_catno_similarity('PRO-电子-01', 'PRO-电子-02'), 0.6)
+        self.assertEqual(0.0, _catno_similarity('', 'R-123'))
+        self.assertEqual(0.0, _catno_similarity('   ', 'R-123'))
+
+    def test_is_various_artists(self):
+        # Default set recognises common conventions and localized forms,
+        # case/space-insensitive.
+        for name in (
+            'Various Artists',
+            'various artists',
+            '  VA ',
+            'V.A.',
+            'V/A',
+            'Various',
+            'Various Artist',
+            'Verschiedene Interpreten',
+            'Varios Artistas',
+            'Artisti vari',
+            '群星',
+            '여러 아티스트',
+            'Разные артисты',
+        ):
+            self.assertTrue(_is_various_artists(name), msg=name)
+        # Real artists, non-generic names and empty values are not VA.
+        for name in ('ABBA', 'The Various Band', 'Various Composers', '', None):
+            self.assertFalse(_is_various_artists(name), msg=repr(name))
+        # A caller-supplied name set (e.g. a localized va_name) is honoured.
+        self.assertTrue(_is_various_artists('Mi Nombre VA', va_names=frozenset({'mi nombre va'})))
+        self.assertFalse(_is_various_artists('Various Artists', va_names=frozenset({'mi nombre va'})))
+        # When an album-artist MBID is known it is authoritative: the special
+        # Various Artists MBID is VA regardless of name...
+        self.assertTrue(_is_various_artists('Anything', albumartist_id=VARIOUS_ARTISTS_ID))
+        # ...and a real artist merely *named* "Various Artists" (a known band) is
+        # NOT treated as a compilation when its own MBID is present.
+        self.assertFalse(_is_various_artists('Various Artists', albumartist_id='8e107957-c443-45b4-84f7-8b054499ef78'))
+
+    def test_trackcount_score(self):
+        self.assertEqual(1.0, _trackcount_score(5, 5))
+        self.assertAlmostEqual(0.4, _trackcount_score(6, 5))  # 1 - (1/5)*3
+        self.assertAlmostEqual(0.6, _trackcount_score(4, 5))  # 1 - (1/5)*2
+
+    def test_isrcs_score(self):
+        self.assertEqual(1.0, _isrcs_score(['ISRC1', 'ISRC2'], ['ISRC1', 'ISRC2']))
+        self.assertEqual(1.0, _isrcs_score(['ISRC1'], ['ISRC1']))
+        self.assertEqual(1.0, _isrcs_score(['ISRC1'], ['ISRC1', 'ISRC2']))
+        self.assertEqual(0.8, _isrcs_score(['ISRC1', 'ISRC2'], ['ISRC2', 'ISRC3']))
+        self.assertEqual(0.0, _isrcs_score(['ISRC1'], ['ISRC2', 'ISRC3']))
+        self.assertEqual(0.5, _isrcs_score(['ISRC1'], []))
+        self.assertEqual(0.5, _isrcs_score([], []))
+        self.assertEqual(0.5, _isrcs_score([], ['ISRC1', 'ISRC2']))
+
+    def test_format_sim_breakdown(self):
+        # Explicit "sim = base x score" breakdown for MATCHING debug lines.
+        m = SimMatchRelease(similarity=0.1826, release=None, base_similarity=0.6764)
+        self.assertEqual("sim=0.1826 = base 0.6764 x score 0.27", _format_sim_breakdown(m))
+        # score derives to 1.00 when base == similarity
+        m = SimMatchRelease(similarity=0.9810, release=None, base_similarity=0.9810)
+        self.assertEqual("sim=0.9810 = base 0.9810 x score 1.00", _format_sim_breakdown(m))
+        # base None (e.g. no-match sentinel) -> similarity only, no division
+        m = SimMatchRelease(similarity=-1, release=None)
+        self.assertEqual("sim=-1.0000", _format_sim_breakdown(m))
+        # base 0 -> guarded, no ZeroDivisionError
+        m = SimMatchRelease(similarity=0.0, release=None, base_similarity=0.0)
+        self.assertEqual("sim=0.0000 = base 0.0000 x score 0.00", _format_sim_breakdown(m))
+
+
+class PreferredWeightsTest(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch_tagger_instance('picard.item')
+
+    def test_preferred_release_types_preferred(self):
+        release = load_test_json('release.json')  # primary-type = Album
+        parts = []
+        _weights_from_preferred_release_types(parts, release, ['Album'], [], 10)
+        score, weight = parts[0]
+        self.assertGreater(score, 0.5)
+        self.assertEqual(weight, 10)
+
+    def test_preferred_release_types_preferred_order(self):
+        release = load_test_json('release.json')  # primary-type = Album
+        parts1 = []
+        _weights_from_preferred_release_types(parts1, release, ['Album', 'EP'], [], 10)
+        parts2 = []
+        _weights_from_preferred_release_types(parts2, release, ['EP', 'Album'], [], 10)
+        # Album is first in parts1 → higher score
+        self.assertGreater(parts1[0][0], parts2[0][0])
+
+    def test_preferred_release_types_discouraged(self):
+        release = load_test_json('release.json')  # primary-type = Album
+        parts = []
+        _weights_from_preferred_release_types(parts, release, [], ['Album'], 10)
+        # Discouraged triggers skip
+        self.assertEqual(parts[0], _SKIP_RELEASE_WEIGHT)
+
+    def test_preferred_release_types_unlisted(self):
+        release = load_test_json('release.json')  # primary-type = Album
+        parts = []
+        _weights_from_preferred_release_types(parts, release, ['EP'], [], 10)
+        # Album is unlisted → neutral 0.5
+        self.assertAlmostEqual(parts[0][0], 0.5)
+
+    def test_preferred_release_types_no_type(self):
+        release = load_test_json('release_no_type.json')
+        parts = []
+        _weights_from_preferred_release_types(parts, release, ['Album'], ['Compilation'], 10)
+        # No type → neutral 0.5
+        self.assertAlmostEqual(parts[0][0], 0.5)
+        self.assertEqual(parts[0][1], 10)
+
+    def test_get_weighted_release_parts(self):
+        weights = {
+            'similarity': {'album': 10, 'totaltracks': 5, 'title': 12},
+            'preferences': {'releasecountry': 5, 'isvideo': 2},
+        }
+        parts = _get_weighted_release_parts(weights, 0.5)
+        self.assertIsInstance(parts, ReleaseMatchParts)
+        self.assertEqual(parts.identifiers, [])
+        self.assertEqual(parts.similarity, [(0.5, 15)])
+        self.assertEqual(parts.preferences, [(0.5, 5)])
+
+    def test_preferred_countries(self):
+        release = load_test_json('release.json')
+        parts = []
+        _weights_from_preferred_countries(parts, release, [], 666)
+        self.assertFalse(parts)
+        _weights_from_preferred_countries(parts, release, ['FR'], 666)
+        self.assertEqual(parts[0], (0.0, 666))
+        _weights_from_preferred_countries(parts, release, ['GB'], 666)
+        self.assertEqual(parts[1], (1.0, 666))
+
+    def test_preferred_formats(self):
+        release = load_test_json('release.json')
+        parts = []
+        _weights_from_preferred_formats(parts, release, [], 777)
+        self.assertFalse(parts)
+        _weights_from_preferred_formats(parts, release, ['Digital Media'], 777)
+        self.assertEqual(parts[0], (0.0, 777))
+        _weights_from_preferred_formats(parts, release, ['12" Vinyl'], 777)
+        self.assertEqual(parts[1], (1.0, 777))
+
+
+SimMatchTest = namedtuple('SimMatchTest', 'similarity name')
+
+
+class SortBySimilarity(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+        self.test_values = [
+            SimMatchTest(similarity=0.74, name='d'),
+            SimMatchTest(similarity=0.61, name='a'),
+            SimMatchTest(similarity=0.75, name='b'),
+            SimMatchTest(similarity=0.75, name='c'),
+        ]
+
+    def test_sort_by_similarity(self):
+        results = [result.name for result in sort_by_similarity(self.test_values)]
+        self.assertEqual(results, ['b', 'c', 'd', 'a'])
+
+    def test_findbestmatch(self):
+        no_match = SimMatchTest(similarity=-1, name='no_match')
+        best_match = find_best_match(self.test_values, no_match)
+
+        self.assertEqual(best_match.result.name, 'b')
+        self.assertEqual(best_match.similarity, 0.75)
+
+    def test_findbestmatch_nomatch(self):
+        self.test_values = []
+
+        no_match = SimMatchTest(similarity=-1, name='no_match')
+        best_match = find_best_match(self.test_values, no_match)
+
+        self.assertEqual(best_match.result.name, 'no_match')
+        self.assertEqual(best_match.similarity, -1)
+
+    def test_find_best_match_with_margin(self):
+        no_match = SimMatchTest(similarity=-1, name='no_match')
+        best_match = find_best_match_with_margin(self.test_values, no_match)
+
+        self.assertEqual(best_match.result.name, 'b')
+        self.assertEqual(best_match.similarity, 0.75)
+        self.assertIsNone(best_match.reason)
+
+    def test_find_best_match_with_margin_min_similarity(self):
+        no_match = SimMatchTest(similarity=-1, name='no_match')
+        best_match = find_best_match_with_margin(self.test_values, no_match, min_similarity=0.75)
+
+        self.assertEqual(best_match.result.name, 'b')
+        self.assertEqual(best_match.similarity, 0.75)
+        self.assertIsNone(best_match.reason)
+
+    def test_find_best_match_with_margin_ambiguous(self):
+        no_match = SimMatchTest(similarity=-1, name='no_match')
+        best_match = find_best_match_with_margin(self.test_values, no_match, min_margin=0.01)
+
+        self.assertEqual(best_match.result.name, 'b')
+        self.assertEqual(best_match.similarity, 0.75)
+        self.assertEqual(best_match.reason, 'ambiguous')
+
+    def test_find_best_match_with_margin_below_floor(self):
+        no_match = SimMatchTest(similarity=-1, name='no_match')
+        best_match = find_best_match_with_margin(self.test_values, no_match, min_similarity=0.76)
+
+        self.assertEqual(best_match.result, no_match)
+        self.assertEqual(best_match.similarity, -1)
+        self.assertEqual(best_match.reason, 'below_floor')

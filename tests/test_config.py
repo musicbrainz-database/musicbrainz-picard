@@ -1,0 +1,1469 @@
+# Picard, the next-generation MusicBrainz tagger
+#
+# Copyright (C) 2019-2022, 2024-2026 Laurent Monin
+# Copyright (C) 2019-2022, 2024-2026 Philipp Wolfer
+# Copyright (C) 2024-2026 Bob Swift
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+
+from enum import (
+    Enum,
+    IntEnum,
+)
+import logging
+import os
+import shutil
+from typing import ClassVar
+from unittest import mock
+
+from test.picardtestcase import (
+    PicardTestCase,
+    subtest_cases,
+)
+
+from picard import (
+    PICARD_VERSION,
+    config,
+)
+from picard.config import (
+    BoolOption,
+    Config,
+    ConfigUpgradeError,
+    FloatOption,
+    IntOption,
+    ListOption,
+    Option,
+    OptionError,
+    OutOfBoundsError,
+    TextOption,
+    get_quick_menu_items,
+    register_quick_menu_item,
+)
+
+# Imported for its registration side effect: populates config._OBSOLETE_OPTIONS
+# via obsolete_options() so tests using the real registry (e.g.
+# release_type_scores) are deterministic regardless of test ordering.
+import picard.config_upgrade_hooks  # noqa: F401,E402
+from picard.version import Version
+
+
+class TestPicardConfigCommon(PicardTestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.tmp_directory = self.mktmpdir()
+
+        self.configpath = os.path.join(self.tmp_directory, 'test.ini')
+        shutil.copy(os.path.join('test', 'data', 'test.ini'), self.configpath)
+        self.addCleanup(os.remove, self.configpath)
+
+        self.config = Config.from_file(None, self.configpath)
+        self.addCleanup(self.cleanup_config_obj)
+
+        self.config.application["version"] = "testing"
+        self.original_logging_disable = logging.root.manager.disable
+        logging.disable(logging.ERROR)
+        self.old_registry = dict(Option.registry)
+        Option.registry = {}
+
+    def tearDown(self):
+        Option.registry = self.old_registry
+        logging.disable(self.original_logging_disable)
+
+    def cleanup_config_obj(self):
+        # Ensure QSettings do not recreate the file on exit
+        self.config.sync()
+        del self.config
+        self.config = None
+
+
+class TestPicardConfig(TestPicardConfigCommon):
+    def test_remove(self):
+        TextOption("setting", "text_option", "abc")
+
+        self.config.setting["text_option"] = "def"
+        self.assertEqual(self.config.setting["text_option"], "def")
+
+        self.config.setting.remove("text_option")
+        self.assertEqual(self.config.setting["text_option"], "abc")
+
+
+class TestPicardConfigOption(TestPicardConfigCommon):
+    def test_basic_option(self):
+        Option("setting", "option", "abc")
+        self.assertEqual(self.config.setting["option"], "abc")
+        self.config.setting["option"] = "def"
+        self.assertEqual(self.config.setting["option"], "def")
+
+    def test_option_get(self):
+        Option("setting", "option", "abc")
+        opt = Option.get("setting", "option")
+        self.assertIsInstance(opt, Option)
+        self.assertEqual(opt.default, "abc")
+        self.assertIsNone(Option.get("setting", "not_existing_option"))
+
+    def test_option_without_title(self):
+        Option("setting", "option", "abc")
+        opt = Option.get("setting", "option")
+        self.assertIsNone(opt.title)
+
+    def test_option_with_title(self):
+        Option("setting", "option", "abc", title="Title")
+        opt = Option.get("setting", "option")
+        self.assertEqual(opt.title, "Title")
+
+    def test_option_exists(self):
+        Option("setting", "option", "abc")
+        self.assertTrue(Option.exists("setting", "option"))
+        self.assertFalse(Option.exists("setting", "not_option"))
+
+    def test_option_add_if_missing(self):
+        Option("setting", "option", "abc")
+        Option.add_if_missing("setting", "option", "def")
+        self.assertEqual(self.config.setting["option"], "abc")
+
+        Option.add_if_missing("setting", "missing_option", "def", title="TITLE")
+        self.assertEqual(self.config.setting["missing_option"], "def")
+        self.assertEqual(Option.get_title('setting', 'missing_option'), 'TITLE')
+
+    def test_get_default(self):
+        Option("setting", "option", "abc")
+        self.assertEqual(Option.get_default("setting", "option"), "abc")
+        with self.assertRaisesRegex(OptionError, "^Option setting/unknown_option: No such option"):
+            Option.get_default("setting", "unknown_option")
+
+    def test_get_title(self):
+        Option("setting", "option", "abc", title="Title")
+        self.assertEqual(Option.get_title("setting", "option"), "Title")
+        with self.assertRaisesRegex(OptionError, "^Option setting/unknown_option: No such option"):
+            Option.get_title("setting", "unknown_option")
+
+    def test_register_option(self):
+        opt = Option("setting", "theoption", "abc")
+        self.assertEqual(Option.registry[("setting", "theoption")], opt)
+        opt.unregister()
+        self.assertNotIn(("setting", "theoption"), Option.registry)
+
+    def test_shareable_default_true(self):
+        Option("setting", "option", "abc")
+        opt = Option.get("setting", "option")
+        self.assertTrue(opt.shareable)
+
+    def test_shareable_explicit_false(self):
+        Option("setting", "option", "secret", shareable=False)
+        opt = Option.get("setting", "option")
+        self.assertFalse(opt.shareable)
+
+    def test_shareable_with_in_profile(self):
+        Option("setting", "option", "value", title="Title", in_profile=True, shareable=False)
+        opt = Option.get("setting", "option")
+        self.assertTrue(opt.in_profile)
+        self.assertFalse(opt.shareable)
+
+
+class TestPicardConfigSection(TestPicardConfigCommon):
+    def test_as_dict(self):
+        TextOption("setting", "text_option", "abc")
+        BoolOption("setting", "bool_option", True)
+        IntOption("setting", "int_option", 42)
+
+        self.config.setting["int_option"] = 123
+
+        expected = {
+            "text_option": "abc",
+            "bool_option": True,
+            "int_option": 123,
+        }
+
+        self.assertEqual(expected, self.config.setting.as_dict())
+
+    def test_register_option(self):
+        class TestEnum(Enum):
+            A = "a"
+            B = "b"
+
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        test_cases = [
+            ("text_option", "the default", TextOption, "s"),
+            ("bool_option", True, BoolOption, False),
+            ("int_option", 42, IntOption, 1),
+            ("float_option", 4.2, FloatOption, 1.0),
+            ("list_option", [1, 2], ListOption, ["a"]),
+            ("list_option_from_tuple", (1, 2), ListOption, ["a"]),
+            ("enum_option", TestEnum.A, Option, TestEnum.B),
+            ("int_enum_option", TestIntEnum.A, IntOption, TestIntEnum.B),
+            ("other_option", b"foo", Option, b"bar"),
+        ]
+        for name, default, expected_type, test_value in test_cases:
+            opt = self.config.setting.register_option(name, default)
+            self.assertEqual(Option.registry[('setting', name)], opt)
+            self.assertIsInstance(opt, expected_type)
+            self.assertEqual(opt.default, default)
+            self.assertEqual(self.config.setting[name], default)
+            self.assertEqual(self.config.setting.value(opt), default)
+            self.assertEqual(self.config.setting.value(opt, "other"), "other")
+            self.config.setting[name] = test_value
+            self.assertEqual(self.config.setting[name], test_value)
+            self.assertEqual(self.config.setting.value(opt), test_value)
+
+    def test_register_option_default_none(self):
+        with self.assertRaises(TypeError, msg='Option default value must not be None'):
+            self.config.setting.register_option("invalid_option", None)
+
+    def test_register_option_int_bounds(self):
+        opt = self.config.setting.register_option("int_option", 5, bounds=(2, 10))
+        self.assertIsInstance(opt, IntOption)
+        self.assertEqual(opt.bounds.minimum, 2)
+        self.assertEqual(opt.bounds.maximum, 10)
+        # Clamping applies to a stored out-of-range value.
+        self.config.setting["int_option"] = 100
+        self.assertEqual(self.config.setting["int_option"], 10)
+
+    def test_register_option_float_bounds(self):
+        opt = self.config.setting.register_option("float_option", 0.5, bounds=(0.0, 1.0))
+        self.assertIsInstance(opt, FloatOption)
+        self.assertEqual(opt.bounds.minimum, 0.0)
+        self.assertEqual(opt.bounds.maximum, 1.0)
+        self.config.setting["float_option"] = 2.0
+        self.assertEqual(self.config.setting["float_option"], 1.0)
+
+    @subtest_cases(
+        "name,default",
+        {
+            'text option': ("text_option", "x"),
+            'bool option': ("bool_option", True),
+            'list option': ("list_option", [1]),
+        },
+    )
+    def test_register_option_bounds_rejected_for_non_numeric(self, name, default):
+        with self.assertRaises(TypeError):
+            self.config.setting.register_option(name, default, bounds=(0, 1))
+
+    def test_register_option_bounds_forwarded_in_profile_section(self):
+        from picard.config import ProfileConfigSection
+
+        section = ProfileConfigSection(self.config, 'test_plugin')
+        opt = section.register_option('threads', 4, bounds=(1, 9))
+        self.assertIsInstance(opt, IntOption)
+        self.assertEqual(opt.bounds.minimum, 1)
+        self.assertEqual(opt.bounds.maximum, 9)
+        # A stored out-of-range value is clamped when read back through the
+        # plugin config section.
+        section['threads'] = 100
+        self.assertEqual(section['threads'], 9)
+
+    def test_profile_override_on_config_section(self):
+        from picard.config import (
+            ProfileConfigSection,
+            SettingConfigSection,
+        )
+
+        section = ProfileConfigSection(self.config, 'test_plugin')
+        section.register_option('my_opt', 'default', in_profile=True)
+
+        # No profiles active — should return default
+        self.assertEqual(section['my_opt'], 'default')
+
+        # Set up a profile and store override in global profile settings
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {'p1': {'test_plugin/my_opt': 'overridden'}}
+
+        self.assertEqual(section['my_opt'], 'overridden')
+
+    def test_profile_override_not_applied_without_in_profile(self):
+        from picard.config import (
+            ProfileConfigSection,
+            SettingConfigSection,
+        )
+
+        section = ProfileConfigSection(self.config, 'test_plugin2')
+        section.register_option('my_opt', 'default', in_profile=False)
+
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {'p1': {'test_plugin2/my_opt': 'overridden'}}
+
+        # Should NOT apply override since in_profile=False
+        self.assertEqual(section['my_opt'], 'default')
+
+    def test_profile_override_setitem(self):
+        from picard.config import (
+            ProfileConfigSection,
+            SettingConfigSection,
+        )
+
+        section = ProfileConfigSection(self.config, 'test_plugin3')
+        section.register_option('my_opt', 'default', in_profile=True)
+
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {'p1': {'test_plugin3/my_opt': 'original'}}
+
+        # Write should go to profile settings, not base config
+        section['my_opt'] = 'updated'
+        self.assertEqual(section['my_opt'], 'updated')
+
+        # Verify it was written to profile settings
+        stored = self.config.profiles[SettingConfigSection.SETTINGS_KEY]
+        self.assertEqual(stored['p1']['test_plugin3/my_opt'], 'updated')
+
+    def test_profile_override_setitem_with_settings_override(self):
+        """When settings_override is active (dialog open), writes should go there."""
+        from picard.config import (
+            ProfileConfigSection,
+            SettingConfigSection,
+        )
+
+        section = ProfileConfigSection(self.config, 'test_plugin4')
+        section.register_option('my_opt', 'default', in_profile=True)
+
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {'p1': {'test_plugin4/my_opt': 'persisted'}}
+
+        # Simulate dialog open — set override
+        override = {'p1': {'test_plugin4/my_opt': 'dialog_value'}}
+        self.config.setting.set_settings_override(override)
+        self.config.setting.set_profiles_override([{'id': 'p1', 'enabled': True}])
+
+        # Read should come from override
+        self.assertEqual(section['my_opt'], 'dialog_value')
+
+        # Write should go to override, not QSettings
+        section['my_opt'] = 'new_dialog_value'
+        self.assertEqual(override['p1']['test_plugin4/my_opt'], 'new_dialog_value')
+        self.assertEqual(section['my_opt'], 'new_dialog_value')
+
+        # Persisted value should be unchanged
+        persisted = self.config.profiles[SettingConfigSection.SETTINGS_KEY]
+        self.assertEqual(persisted['p1']['test_plugin4/my_opt'], 'persisted')
+
+        self.config.setting.set_settings_override(None)
+        self.config.setting.set_profiles_override(None)
+
+
+class TestPicardConfigTextOption(TestPicardConfigCommon):
+    # TextOption
+    def test_text_opt_convert(self):
+        opt = TextOption("setting", "text_option", "abc")
+        self.assertEqual(opt.convert(123), "123")
+
+    def test_text_opt_no_config(self):
+        TextOption("setting", "text_option", "abc")
+
+        # test default, nothing in config yet
+        self.assertEqual(self.config.setting["text_option"], "abc")
+        self.assertIs(type(self.config.setting["text_option"]), str)
+
+    def test_text_opt_set_read_back(self):
+        TextOption("setting", "text_option", "abc")
+
+        # set option to "def", and read back
+        self.config.setting["text_option"] = "def"
+        self.assertEqual(self.config.setting["text_option"], "def")
+        self.assertIs(type(self.config.setting["text_option"]), str)
+
+    def test_text_opt_set_none(self):
+        TextOption("setting", "text_option", "abc")
+
+        # set option to None
+        self.config.setting["text_option"] = None
+        self.assertEqual(self.config.setting["text_option"], "")
+
+    def test_text_opt_set_empty(self):
+        TextOption("setting", "text_option", "abc")
+
+        # set option to ""
+        self.config.setting["text_option"] = ""
+        self.assertEqual(self.config.setting["text_option"], "")
+
+    def test_text_opt_invalid_value(self):
+        ListOption("setting", "text_option", [1, 2])
+
+        # store invalid value in config file directly
+        self.config.setValue('setting/text_option', object)
+        self.assertEqual(self.config.setting["text_option"], [1, 2])
+
+
+class TestPicardConfigBoolOption(TestPicardConfigCommon):
+    # BoolOption
+    def test_bool_opt_convert(self):
+        opt = BoolOption("setting", "bool_option", False)
+        self.assertEqual(opt.convert(1), True)
+
+    def test_bool_opt_no_config(self):
+        BoolOption("setting", "bool_option", True)
+
+        # test default, nothing in config yet
+        self.assertEqual(self.config.setting["bool_option"], True)
+        self.assertIs(type(self.config.setting["bool_option"]), bool)
+
+    def test_bool_opt_set_read_back(self):
+        BoolOption("setting", "bool_option", True)
+
+        # set option and read back
+        self.config.setting["bool_option"] = False
+        self.assertEqual(self.config.setting["bool_option"], False)
+        self.assertIs(type(self.config.setting["bool_option"]), bool)
+
+    def test_bool_opt_set_str(self):
+        BoolOption("setting", "bool_option", False)
+
+        # set option to invalid value
+        self.config.setting["bool_option"] = 'yes'
+        self.assertEqual(self.config.setting["bool_option"], True)
+
+    def test_bool_opt_set_empty_str(self):
+        BoolOption("setting", "bool_option", True)
+
+        # set option to empty string
+        self.config.setting["bool_option"] = ''
+        self.assertEqual(self.config.setting["bool_option"], False)
+
+    def test_bool_opt_set_none(self):
+        BoolOption("setting", "bool_option", True)
+
+        # set option to None value
+        self.config.setting["bool_option"] = None
+        self.assertEqual(self.config.setting["bool_option"], False)
+
+    def test_bool_opt_set_direct_str(self):
+        BoolOption("setting", "bool_option", False)
+
+        # store invalid bool value in config file directly
+        self.config.setValue('setting/bool_option', 'yes')
+        self.assertEqual(self.config.setting["bool_option"], True)
+
+    def test_bool_opt_set_direct_str_true(self):
+        BoolOption("setting", "bool_option", False)
+
+        # store 'true' directly, it should be ok, due to conversion
+        self.config.setValue('setting/bool_option', 'true')
+        self.assertEqual(self.config.setting["bool_option"], True)
+
+
+class TestPicardConfigIntOption(TestPicardConfigCommon):
+    # IntOption
+    def test_int_opt_convert(self):
+        opt = IntOption("setting", "int_option", 666)
+        self.assertEqual(opt.convert("123"), 123)
+
+    def test_int_opt_convert_intenum(self):
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        opt = IntOption("setting", "int_option", TestIntEnum.A)
+        self.assertEqual(opt.convert(2), TestIntEnum.B)
+        self.assertIsInstance(opt.convert("2"), TestIntEnum)
+        # An invalid enum member falls back to the default rather than raising.
+        self.assertEqual(opt.convert(3), TestIntEnum.A)
+
+    def test_int_opt_no_config(self):
+        IntOption("setting", "int_option", 666)
+
+        # test default, nothing in config yet
+        self.assertEqual(self.config.setting["int_option"], 666)
+        self.assertIs(type(self.config.setting["int_option"]), int)
+
+    def test_int_opt_set_read_back(self):
+        IntOption("setting", "int_option", 666)
+
+        # set option and read back
+        self.config.setting["int_option"] = 333
+        self.assertEqual(self.config.setting["int_option"], 333)
+        self.assertIs(type(self.config.setting["int_option"]), int)
+
+    def test_int_opt_not_int(self):
+        IntOption("setting", "int_option", 666)
+
+        # set option to invalid value
+        self.config.setting["int_option"] = 'invalid'
+        self.assertEqual(self.config.setting["int_option"], 666)
+
+    def test_int_opt_set_none(self):
+        IntOption("setting", "int_option", 666)
+
+        # set option to None
+        self.config.setting["int_option"] = None
+        self.assertEqual(self.config.setting["int_option"], 666)
+
+    def test_int_opt_direct_invalid(self):
+        IntOption("setting", "int_option", 666)
+
+        # store invalid int value in config file directly
+        self.config.setValue('setting/int_option', 'x333')
+        self.assertEqual(self.config.setting["int_option"], 666)
+
+    def test_int_opt_direct_validstr(self):
+        IntOption("setting", "int_option", 666)
+
+        # store int as string directly, it should be ok, due to conversion
+        self.config.setValue('setting/int_option', '333')
+        self.assertEqual(self.config.setting["int_option"], 333)
+
+    def test_int_opt_no_bounds_by_default(self):
+        opt = IntOption("setting", "int_option", 5)
+        self.assertIsNone(opt.bounds.minimum)
+        self.assertIsNone(opt.bounds.maximum)
+        # Without bounds any value passes through unchanged.
+        self.assertEqual(opt.convert(-1000), -1000)
+        self.assertEqual(opt.convert(1000), 1000)
+
+    @subtest_cases(
+        "bounds,value,expected",
+        [
+            # In range: unchanged.
+            ((2, 10), 2, 2),
+            ((2, 10), 5, 5),
+            ((2, 10), 10, 10),
+            # Below minimum: clamped up.
+            ((2, None), 1, 2),
+            ((2, None), -100, 2),
+            # Above maximum: clamped down.
+            ((None, 10), 11, 10),
+            ((None, 10), 100, 10),
+        ],
+    )
+    def test_int_opt_clamp(self, bounds, value, expected):
+        opt = IntOption("setting", "int_option", 5, bounds=bounds)
+        self.assertEqual(opt.convert(value), expected)
+
+    def test_int_opt_clamp_warns(self):
+        opt = IntOption("setting", "int_option", 5, bounds=(2, 10))
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs('main', level='WARNING') as cm:
+                self.assertEqual(opt.convert(1), 2)
+            self.assertIn('out of bounds', ''.join(cm.output))
+            self.assertIn('clamping to 2', ''.join(cm.output))
+            with self.assertLogs('main', level='WARNING') as cm:
+                self.assertEqual(opt.convert(99), 10)
+            self.assertIn('out of bounds', ''.join(cm.output))
+            self.assertIn('clamping to 10', ''.join(cm.output))
+        finally:
+            logging.disable(logging.ERROR)
+
+    def test_int_opt_bounds_via_stored_value(self):
+        IntOption("setting", "int_option", 5, bounds=(2, 10))
+        # A stored value outside the range is clamped on read.
+        self.config.setValue('setting/int_option', 1)
+        self.assertEqual(self.config.setting["int_option"], 2)
+
+    def test_int_opt_bounds_ignored_for_intenum(self):
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        # bounds are accepted but do not apply to enum options.
+        opt = IntOption("setting", "int_option", TestIntEnum.A, bounds=(5, 6))
+        self.assertEqual(opt.convert(2), TestIntEnum.B)
+
+    def test_int_opt_invalid_intenum_falls_back_to_default(self):
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        opt = IntOption("setting", "int_option", TestIntEnum.B)
+        # An invalid enum member falls back to the default instead of raising.
+        self.assertEqual(opt.convert(99), TestIntEnum.B)
+
+    def test_int_opt_invalid_intenum_warns(self):
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        opt = IntOption("setting", "int_option", TestIntEnum.A)
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs('main', level='WARNING') as cm:
+                self.assertEqual(opt.convert(99), TestIntEnum.A)
+            self.assertIn('not a valid TestIntEnum', ''.join(cm.output))
+        finally:
+            logging.disable(logging.ERROR)
+
+    def test_int_opt_invalid_intenum_via_stored_value(self):
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        IntOption("setting", "int_option", TestIntEnum.A)
+        # A stored value that is not a valid member falls back to the default.
+        self.config.setValue('setting/int_option', 99)
+        self.assertEqual(self.config.setting["int_option"], TestIntEnum.A)
+
+    def test_int_opt_checked_convert_raises_out_of_bounds(self):
+        opt = IntOption("setting", "int_option", 5, bounds=(2, 10))
+        # In range: returns the value unchanged, no raise.
+        self.assertEqual(opt.checked_convert(5), 5)
+        with self.assertRaises(OutOfBoundsError) as ctx:
+            opt.checked_convert(99)
+        self.assertEqual(ctx.exception.value, 99)
+        self.assertEqual(ctx.exception.corrected, 10)
+        self.assertIs(ctx.exception.option, opt)
+        # OutOfBoundsError is a ValueError so existing handlers keep working.
+        self.assertIsInstance(ctx.exception, ValueError)
+        with self.assertRaises(OutOfBoundsError) as ctx:
+            opt.checked_convert(0)
+        self.assertEqual(ctx.exception.corrected, 2)
+
+    def test_int_opt_checked_convert_does_not_log(self):
+        opt = IntOption("setting", "int_option", 5, bounds=(2, 10))
+        logging.disable(logging.NOTSET)
+        try:
+            # Pure detection: checked_convert must not log; only convert() does.
+            with self.assertNoLogs('main', level='WARNING'):
+                with self.assertRaises(OutOfBoundsError):
+                    opt.checked_convert(99)
+        finally:
+            logging.disable(logging.ERROR)
+
+    def test_int_opt_checked_convert_invalid_intenum_raises(self):
+        class TestIntEnum(IntEnum):
+            A = 1
+            B = 2
+
+        opt = IntOption("setting", "int_option", TestIntEnum.A)
+        self.assertEqual(opt.checked_convert(2), TestIntEnum.B)
+        with self.assertRaises(OutOfBoundsError) as ctx:
+            opt.checked_convert(99)
+        self.assertEqual(ctx.exception.value, 99)
+        self.assertEqual(ctx.exception.corrected, TestIntEnum.A)
+
+    @subtest_cases(
+        "bounds,exception",
+        {
+            'bool bound': ((True, None), TypeError),
+            'minimum greater than maximum': ((10, 2), ValueError),
+        },
+    )
+    def test_int_opt_bounds_rejected(self, bounds, exception):
+        with self.assertRaises(exception):
+            IntOption("setting", "int_option", 5, bounds=bounds)
+
+    def test_int_opt_float_bounds_yield_int_values(self):
+        # A float bound literal may be declared for an int option. The bound is
+        # kept as declared for the comparison, but the converted/clamped value
+        # (and the reported corrected value) is always int.
+        opt = IntOption("setting", "int_option", 1, bounds=(0, 2.5))
+        self.assertEqual(opt.bounds.maximum, 2.5)  # bound kept as declared
+        self.assertEqual(opt.convert(2), 2)
+        self.assertEqual(opt.convert(3), 2)  # clamped to 2.5, coerced to int 2
+        self.assertIsInstance(opt.convert(3), int)
+        with self.assertRaises(OutOfBoundsError) as ctx:
+            opt.checked_convert(3)
+        self.assertEqual(ctx.exception.corrected, 2)
+        self.assertIsInstance(ctx.exception.corrected, int)
+
+    def test_int_opt_bounds_convert_string(self):
+        # Values read from an INI config arrive as strings; a bounded option
+        # must coerce before comparing against its bounds (regression test).
+        opt = IntOption("setting", "int_option", 5, bounds=(2, 10))
+        self.assertEqual(opt.convert("5"), 5)
+        self.assertEqual(opt.convert("99"), 10)
+        self.assertEqual(opt.checked_convert("7"), 7)
+        with self.assertRaises(OutOfBoundsError):
+            opt.checked_convert("99")
+
+
+class TestPicardConfigFloatOption(TestPicardConfigCommon):
+    # FloatOption
+    def test_float_opt_convert(self):
+        opt = FloatOption("setting", "float_option", 666.6)
+        self.assertEqual(opt.convert("333.3"), 333.3)
+
+    def test_float_opt_no_config(self):
+        FloatOption("setting", "float_option", 666.6)
+
+        # test default, nothing in config yet
+        self.assertEqual(self.config.setting["float_option"], 666.6)
+        self.assertIs(type(self.config.setting["float_option"]), float)
+
+    def test_float_opt_set_read_back(self):
+        FloatOption("setting", "float_option", 666.6)
+
+        # set option and read back
+        self.config.setting["float_option"] = 333.3
+        self.assertEqual(self.config.setting["float_option"], 333.3)
+        self.assertIs(type(self.config.setting["float_option"]), float)
+
+    def test_float_opt_not_float(self):
+        FloatOption("setting", "float_option", 666.6)
+
+        # set option to invalid value
+        self.config.setting["float_option"] = 'invalid'
+        self.assertEqual(self.config.setting["float_option"], 666.6)
+
+    def test_float_opt_set_none(self):
+        FloatOption("setting", "float_option", 666.6)
+
+        # set option to None
+        self.config.setting["float_option"] = None
+        self.assertEqual(self.config.setting["float_option"], 666.6)
+
+    def test_float_opt_direct_invalid(self):
+        FloatOption("setting", "float_option", 666.6)
+
+        # store invalid float value in config file directly
+        self.config.setValue('setting/float_option', '333.3x')
+        self.assertEqual(self.config.setting["float_option"], 666.6)
+
+    def test_float_opt_direct_validstr(self):
+        FloatOption("setting", "float_option", 666.6)
+
+        # store float as string directly, it should be ok, due to conversion
+        self.config.setValue('setting/float_option', '333.3')
+        self.assertEqual(self.config.setting["float_option"], 333.3)
+
+    def test_float_opt_no_bounds_by_default(self):
+        opt = FloatOption("setting", "float_option", 0.5)
+        self.assertIsNone(opt.bounds.minimum)
+        self.assertIsNone(opt.bounds.maximum)
+        self.assertEqual(opt.convert(-10.0), -10.0)
+        self.assertEqual(opt.convert(10.0), 10.0)
+
+    @subtest_cases(
+        "bounds,value,expected",
+        [
+            # In range: unchanged.
+            ((0.0, 1.0), 0.0, 0.0),
+            ((0.0, 1.0), 0.5, 0.5),
+            ((0.0, 1.0), 1.0, 1.0),
+            # Below minimum / above maximum: clamped.
+            ((0.0, None), -0.5, 0.0),
+            ((None, 1.0), 1.5, 1.0),
+        ],
+    )
+    def test_float_opt_clamp(self, bounds, value, expected):
+        opt = FloatOption("setting", "float_option", 0.5, bounds=bounds)
+        self.assertEqual(opt.convert(value), expected)
+
+    def test_float_opt_clamp_warns(self):
+        opt = FloatOption("setting", "float_option", 0.5, bounds=(0.0, 1.0))
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs('main', level='WARNING') as cm:
+                self.assertEqual(opt.convert(-1.0), 0.0)
+            self.assertIn('out of bounds', ''.join(cm.output))
+            self.assertIn('clamping to 0.0', ''.join(cm.output))
+            with self.assertLogs('main', level='WARNING') as cm:
+                self.assertEqual(opt.convert(2.0), 1.0)
+            self.assertIn('out of bounds', ''.join(cm.output))
+            self.assertIn('clamping to 1.0', ''.join(cm.output))
+        finally:
+            logging.disable(logging.ERROR)
+
+    def test_float_opt_bounds_via_stored_value(self):
+        FloatOption("setting", "float_option", 0.5, bounds=(0.0, 1.0))
+        self.config.setValue('setting/float_option', 2.5)
+        self.assertEqual(self.config.setting["float_option"], 1.0)
+
+    def test_float_opt_checked_convert_raises_out_of_bounds(self):
+        opt = FloatOption("setting", "float_option", 0.5, bounds=(0.0, 1.0))
+        self.assertEqual(opt.checked_convert(0.5), 0.5)
+        with self.assertRaises(OutOfBoundsError) as ctx:
+            opt.checked_convert(2.5)
+        self.assertEqual(ctx.exception.corrected, 1.0)
+        self.assertIsInstance(ctx.exception, ValueError)
+
+    def test_float_opt_bounds_accepts_int(self):
+        # int bound literals are accepted for a float option and kept as
+        # declared for the comparison, but convert returns float values.
+        opt = FloatOption("setting", "float_option", 0.5, bounds=(0, 1))
+        self.assertIsInstance(opt.bounds.minimum, int)
+        self.assertIsInstance(opt.bounds.maximum, int)
+        self.assertEqual(opt.convert(-1.0), 0.0)
+        self.assertEqual(opt.convert(2.0), 1.0)
+        self.assertIsInstance(opt.convert(2.0), float)
+
+    @subtest_cases(
+        "bounds,exception",
+        {
+            'bool bound': ((True, None), TypeError),
+            'minimum greater than maximum': ((1.0, 0.0), ValueError),
+        },
+    )
+    def test_float_opt_bounds_rejected(self, bounds, exception):
+        with self.assertRaises(exception):
+            FloatOption("setting", "float_option", 0.5, bounds=bounds)
+
+    def test_float_opt_bounds_convert_string(self):
+        # Values read from an INI config arrive as strings; a bounded option
+        # must coerce before comparing against its bounds (regression test).
+        opt = FloatOption("setting", "float_option", 0.5, bounds=(0.0, 1.0))
+        self.assertEqual(opt.convert("0.5"), 0.5)
+        self.assertEqual(opt.convert("2.5"), 1.0)
+        self.assertEqual(opt.checked_convert("0.5"), 0.5)
+        with self.assertRaises(OutOfBoundsError):
+            opt.checked_convert("2.5")
+
+
+class TestPicardConfigListOption(TestPicardConfigCommon):
+    def test_list_opt_convert(self):
+        opt = ListOption("setting", "list_option", [])
+        self.assertEqual(opt.convert(('1', '2', '3')), ['1', '2', '3'])
+
+    def test_list_opt_no_config(self):
+        ListOption("setting", "list_option", ["a", "b"])
+
+        # test default, nothing in config yet
+        self.assertEqual(self.config.setting["list_option"], ["a", "b"])
+        self.assertIs(type(self.config.setting["list_option"]), list)
+
+    def test_list_opt_set_read_back(self):
+        ListOption("setting", "list_option", ["a", "b"])
+
+        # set option and read back
+        self.config.setting["list_option"] = ["c", "d"]
+        self.assertEqual(self.config.setting["list_option"], ["c", "d"])
+        self.assertIs(type(self.config.setting["list_option"]), list)
+
+    def test_list_opt_not_list(self):
+        ListOption("setting", "list_option", ["a", "b"])
+
+        # set option to invalid value
+        self.config.setting["list_option"] = 'invalid'
+        self.assertEqual(self.config.setting["list_option"], ["a", "b"])
+
+    def test_list_opt_set_none(self):
+        ListOption("setting", "list_option", ["a", "b"])
+
+        # set option to None
+        self.config.setting["list_option"] = None
+        self.assertEqual(self.config.setting["list_option"], [])
+
+    def test_list_opt_set_empty(self):
+        ListOption("setting", "list_option", ["a", "b"])
+
+        # set option to empty list
+        self.config.setting["list_option"] = []
+        self.assertEqual(self.config.setting["list_option"], [])
+
+    def test_list_opt_direct_invalid(self):
+        ListOption("setting", "list_option", ["a", "b"])
+
+        # store invalid list value in config file directly
+        self.config.setValue('setting/list_option', 'efg')
+        self.assertEqual(self.config.setting["list_option"], ["a", "b"])
+
+
+class TestPicardConfigVarOption(TestPicardConfigCommon):
+    # Option
+    def test_var_opt_convert(self):
+        opt = Option("setting", "var_option", set())
+        self.assertEqual(opt.convert(["a", "b", "a"]), {"a", "b"})
+
+    def test_var_opt_no_config(self):
+        Option("setting", "var_option", {"a", "b"})
+
+        # test default, nothing in config yet
+        self.assertEqual(self.config.setting["var_option"], {"a", "b"})
+        self.assertIs(type(self.config.setting["var_option"]), set)
+
+    def test_var_opt_set_read_back(self):
+        Option("setting", "var_option", {"a", "b"})
+
+        # set option to "def", and read back
+        self.config.setting["var_option"] = {"c", "d"}
+        self.assertEqual(self.config.setting["var_option"], {"c", "d"})
+        self.assertIs(type(self.config.setting["var_option"]), set)
+
+    def test_var_opt_set_none(self):
+        Option("setting", "var_option", {"a", "b"})
+
+        # set option to None
+        self.config.setting["var_option"] = None
+        self.assertEqual(self.config.setting["var_option"], {"a", "b"})
+
+    def test_var_opt_set_empty(self):
+        Option("setting", "var_option", {"a", "b"})
+
+        # set option to ""
+        self.config.setting["var_option"] = set()
+        self.assertEqual(self.config.setting["var_option"], set())
+
+    def test_var_opt_invalid_value(self):
+        Option("setting", "var_option", {"a", "b"})
+
+        # store invalid value in config file directly
+        self.config.setValue('setting/var_option', object)
+        self.assertEqual(self.config.setting["var_option"], {"a", "b"})
+
+
+class TestPicardConfigSignals(TestPicardConfigCommon):
+    def _set_signal_value(self, name: str, old_value: object, new_value: object):
+        self.setting_name = name
+        self.setting_old_value = old_value
+        self.setting_new_value = new_value
+
+    def test_file_naming_signal(self):
+        TextOption('setting', 'option_text', 'abc')
+        BoolOption('setting', 'option_bool', False)
+        IntOption('setting', 'option_int', 1)
+        FloatOption('setting', 'option_float', 1.0)
+        ListOption('setting', 'option_list', [1, 2, 3])
+        Option('setting', 'option_set', {1, 2, 3})
+        Option('setting', 'option_dict', {'a': 1, 'b': 2, 'c': 3})
+
+        self.config.setting.setting_changed.connect(self._set_signal_value)
+
+        # Test text option
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_text'] = 'def'
+        self.assertEqual(self.setting_name, 'option_text')
+        self.assertEqual(self.setting_old_value, 'abc')
+        self.assertEqual(self.setting_new_value, 'def')
+
+        # Test no signal if set to same value
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_text'] = 'def'
+        self.assertEqual(self.setting_name, '')
+        self.assertEqual(self.setting_old_value, '')
+        self.assertEqual(self.setting_new_value, '')
+
+        # Test bool option
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_bool'] = True
+        self.assertEqual(self.setting_name, 'option_bool')
+        self.assertEqual(self.setting_old_value, False)
+        self.assertEqual(self.setting_new_value, True)
+
+        # Test int option
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_int'] = 2
+        self.assertEqual(self.setting_name, 'option_int')
+        self.assertEqual(self.setting_old_value, 1)
+        self.assertEqual(self.setting_new_value, 2)
+
+        # Test float option
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_float'] = 2.5
+        self.assertEqual(self.setting_name, 'option_float')
+        self.assertEqual(self.setting_old_value, 1.0)
+        self.assertEqual(self.setting_new_value, 2.5)
+
+        # Test list option
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_list'] = [3, 2, 1]
+        self.assertEqual(self.setting_name, 'option_list')
+        self.assertEqual(self.setting_old_value, [1, 2, 3])
+        self.assertEqual(self.setting_new_value, [3, 2, 1])
+
+        # Test option (set)
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_set'] = {4, 5, 6}
+        self.assertEqual(self.setting_name, 'option_set')
+        self.assertEqual(self.setting_old_value, {1, 2, 3})
+        self.assertEqual(self.setting_new_value, {4, 5, 6})
+
+        # Test option (dict)
+        self.setting_name = ''
+        self.setting_old_value = ''
+        self.setting_new_value = ''
+        self.config.setting['option_dict'] = {'a': 3, 'b': 2, 'c': 1}
+        self.assertEqual(self.setting_name, 'option_dict')
+        self.assertEqual(self.setting_old_value, {'a': 1, 'b': 2, 'c': 3})
+        self.assertEqual(self.setting_new_value, {'a': 3, 'b': 2, 'c': 1})
+
+
+class TestPicardConfigQuickMenuItems(TestPicardConfigCommon):
+    def _get_menu_items(self):
+        return [x for x in get_quick_menu_items()]
+
+    def test_register_quick_menu_items(self):
+        # Save original dictionary and set new empty dictionary for testing
+        old = config._quick_menu_items
+        config._quick_menu_items = {}
+        self.assertEqual(self._get_menu_items(), [])
+
+        # Set up options for testing
+        BoolOption('setting', 'option_bool_no_title', True)
+        TextOption('setting', 'option_text', 'abc', title="Text")
+        BoolOption('setting', 'option_bool', False, title="Bool")
+        IntOption('setting', 'option_int', 1, title="Int")
+        FloatOption('setting', 'option_float', 1.0, title="Float")
+        ListOption('setting', 'option_list', [1, 2, 3], title="List")
+        Option('setting', 'option_set', {1, 2, 3}, title="Set")
+        Option('setting', 'option_dict', {'a': 1, 'b': 2, 'c': 3}, title="Dict")
+
+        # Test that options without titles are registered with name as fallback
+        option = Option.get('setting', 'option_bool_no_title')
+        register_quick_menu_item(0, 'test_group', None, "test group", option)
+        menu_items = self._get_menu_items()
+        self.assertEqual(len(menu_items), 1)
+        self.assertEqual(menu_items[0]['options'][0].title, 'option_bool_no_title')
+
+        # Test that only boolean options are registered
+        for opt_type in ['bool', 'text', 'int', 'float', 'list', 'set', 'dict']:
+            option = Option.get('setting', f"option_{opt_type}")
+            register_quick_menu_item(0, 'test_group', None, "test group", option)
+            menu_items = self._get_menu_items()
+            self.assertEqual(len(menu_items), 1, f"Error processing '{opt_type}' option.")
+
+        # Restore original dictionary
+        config._quick_menu_items = old
+
+    def test_return_order(self):
+        # Save original dictionary and set new empty dictionary for testing
+        old = config._quick_menu_items
+        config._quick_menu_items = {}
+        self.assertEqual(self._get_menu_items(), [])
+
+        # Set up options for testing
+        BoolOption('setting', 'option1', True, title="Option 1")
+        BoolOption('setting', 'option2', True, title="Option 2")
+        BoolOption('setting', 'option3', True, title="Option 3")
+        BoolOption('setting', 'option4', True, title="Option 4")
+
+        # Register options
+        register_quick_menu_item(2, 'group_2', None, "Group 2", Option.get('setting', 'option4'))
+        register_quick_menu_item(2, 'group_2', None, "Group 2", Option.get('setting', 'option1'))
+        register_quick_menu_item(2, 'group_2', None, "Group 2", Option.get('setting', 'option2'))
+        register_quick_menu_item(1, 'group_1', None, "Group 1", Option.get('setting', 'option3'))
+        register_quick_menu_item(3, 'group_1', None, "Group 1", Option.get('setting', 'option4'))
+
+        # Get menu items
+        items = self._get_menu_items()
+        self.assertEqual(len(items), 2)
+
+        # Confirm order returned is:
+        #   Group 1: 'option3', 'option4'
+        #   Group 2: 'option4', 'option1', 'option2'
+
+        group = items[0]
+        options = group['options']
+        self.assertEqual(group['title'], "Group 1")
+        self.assertEqual(len(options), 2)
+        self.assertEqual(options[0].name, 'option3')
+        self.assertEqual(options[1].name, 'option4')
+
+        group = items[1]
+        options = group['options']
+        self.assertEqual(group['title'], "Group 2")
+        self.assertEqual(len(options), 3)
+        self.assertEqual(options[0].name, 'option4')
+        self.assertEqual(options[1].name, 'option1')
+        self.assertEqual(options[2].name, 'option2')
+
+        # Restore original dictionary
+        config._quick_menu_items = old
+
+    def test_hierarchical_order(self):
+        # Save original dictionary and set new empty dictionary for testing
+        old = config._quick_menu_items
+        config._quick_menu_items = {}
+        self.assertEqual(self._get_menu_items(), [])
+
+        # Set up options for testing
+        BoolOption('setting', 'option1', True, title="Option 1")
+        BoolOption('setting', 'option2', True, title="Option 2")
+        BoolOption('setting', 'option3', True, title="Option 3")
+        BoolOption('setting', 'option4', True, title="Option 4")
+        BoolOption('setting', 'option5', True, title="Option 5")
+        BoolOption('setting', 'option6', True, title="Option 6")
+
+        # Register options
+        register_quick_menu_item(1, 'group_3', 'group_2', "Group 3", Option.get('setting', 'option5'))
+        register_quick_menu_item(1, 'group_3', 'group_2', "Group 3", Option.get('setting', 'option6'))
+        register_quick_menu_item(2, 'group_2', None, "Group 2", Option.get('setting', 'option4'))
+        register_quick_menu_item(2, 'group_2', None, "Group 2", Option.get('setting', 'option1'))
+        register_quick_menu_item(2, 'group_2', None, "Group 2", Option.get('setting', 'option2'))
+        register_quick_menu_item(1, 'group_1', None, "Group 1", Option.get('setting', 'option3'))
+        register_quick_menu_item(3, 'group_1', None, "Group 1", Option.get('setting', 'option4'))
+
+        # Get menu items
+        items = self._get_menu_items()
+        self.assertEqual(len(items), 3)
+
+        # Confirm order returned is:
+        #   Group 1: 'option3', 'option4'
+        #   Group 2: 'option4', 'option1', 'option2'
+        #   Group 3: 'option5', 'option6'
+
+        group = items[0]
+        options = group['options']
+        self.assertEqual(group['title'], "Group 1")
+        self.assertEqual(len(options), 2)
+        self.assertEqual(options[0].name, 'option3')
+        self.assertEqual(options[1].name, 'option4')
+
+        group = items[1]
+        options = group['options']
+        self.assertEqual(group['title'], "Group 2")
+        self.assertEqual(len(options), 3)
+        self.assertEqual(options[0].name, 'option4')
+        self.assertEqual(options[1].name, 'option1')
+        self.assertEqual(options[2].name, 'option2')
+
+        group = items[2]
+        options = group['options']
+        self.assertEqual(group['title'], "Group 3")
+        self.assertEqual(len(options), 2)
+        self.assertEqual(options[0].name, 'option5')
+        self.assertEqual(options[1].name, 'option6')
+
+        # Restore original dictionary
+        config._quick_menu_items = old
+
+    def test_profile_override_no_collision_between_sections(self):
+        """Plugin and core options with the same name must not collide in profile storage."""
+        from picard.config import (
+            ProfileConfigSection,
+            SettingConfigSection,
+            TextOption,
+        )
+
+        # Core option 'greeting' in 'setting' section
+        TextOption('setting', 'greeting', 'core_default', title='Core Greeting', in_profile=True)
+
+        # Plugin option 'greeting' in 'plugin.test' section
+        plugin_section = ProfileConfigSection(self.config, 'plugin.test')
+        plugin_section.register_option('greeting', 'plugin_default', title='Plugin Greeting', in_profile=True)
+
+        # Set up profile with different values for each
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {
+            'p1': {'greeting': 'core_profile_value', 'plugin.test/greeting': 'plugin_profile_value'}
+        }
+
+        # Core should get core value
+        self.assertEqual(self.config.setting['greeting'], 'core_profile_value')
+        # Plugin should get plugin value, not core's
+        self.assertEqual(plugin_section['greeting'], 'plugin_profile_value')
+
+
+class TestRestoreDefaults(TestPicardConfigCommon):
+    def test_restore_defaults_with_profile_core(self):
+        """With profile active, restore_defaults resets profile value, not base."""
+        from picard.config import SettingConfigSection
+
+        from picard.ui.options import (
+            OptionsPage,
+            PageOptionConfigs,
+        )
+
+        TextOption('setting', 'test_rd_prof', 'default_value', in_profile=True)
+
+        # Set base value
+        with self.config.setting.no_profile():
+            self.config.setting['test_rd_prof'] = 'base_value'
+
+        # Set up profile with override
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {'p1': {'test_rd_prof': 'profile_value'}}
+
+        class CorePage(OptionsPage):
+            NAME = 'test_rd_prof_page'
+            TITLE = 'Test'
+            PARENT = None
+            SORT_ORDER = 9999
+            OPTION_SECTION = 'setting'
+            OPTIONS: ClassVar[PageOptionConfigs] = {'test_rd_prof': {}}
+
+        from picard.extension_points.options_pages import register_options_page
+
+        register_options_page(CorePage)
+
+        page = CorePage.__new__(CorePage)
+        page.load = lambda: None
+
+        page.restore_defaults()
+
+        # Profile value should be restored (not persisted as default)
+        self.assertEqual(self.config.setting['test_rd_prof'], 'profile_value')
+        # Base value must be untouched
+        with self.config.setting.no_profile():
+            self.assertEqual(self.config.setting['test_rd_prof'], 'base_value')
+
+    def test_restore_defaults_no_profile_plugin(self):
+        """Plugin page: without profiles, restore_defaults resets to default."""
+        from picard.config import ProfileConfigSection
+
+        from picard.ui.options import (
+            OptionsPage,
+            PageOptionConfigs,
+        )
+
+        section = ProfileConfigSection(self.config, 'plugin.test-rd')
+        TextOption('plugin.test-rd', 'opt', 'plug_default', in_profile=True)
+
+        # Write a non-default base value
+        with self.config.setting.no_profile():
+            section['opt'] = 'plug_user'
+
+        class PlugPage(OptionsPage):
+            NAME = 'test_rd_plug_page'
+            TITLE = 'Plugin'
+            PARENT = None
+            SORT_ORDER = 9999
+            OPTION_SECTION = 'plugin.test-rd'
+            OPTIONS: ClassVar[PageOptionConfigs] = {'opt': {}}
+
+        from picard.extension_points.options_pages import register_options_page
+
+        register_options_page(PlugPage)
+
+        class FakeApi:
+            plugin_config = section
+
+        page = PlugPage.__new__(PlugPage)
+        page.api = FakeApi()
+        page.load = lambda: None
+
+        page.restore_defaults()
+
+        # After restore (no save), value should be back to user value
+        self.assertEqual(section['opt'], 'plug_user')
+
+    def test_restore_defaults_with_profile_plugin(self):
+        """Plugin page: with profile active, only profile value is affected."""
+        from picard.config import (
+            ProfileConfigSection,
+            SettingConfigSection,
+        )
+
+        from picard.ui.options import (
+            OptionsPage,
+            PageOptionConfigs,
+        )
+
+        section = ProfileConfigSection(self.config, 'plugin.test-rd2')
+        TextOption('plugin.test-rd2', 'opt', 'plug_default', in_profile=True)
+
+        # Set base value
+        with self.config.setting.no_profile():
+            section['opt'] = 'plug_base'
+
+        # Set up profile with override
+        ListOption.add_if_missing('profiles', 'user_profiles', [])
+        Option.add_if_missing('profiles', SettingConfigSection.SETTINGS_KEY, {})
+        self.config.profiles['user_profiles'] = [{'id': 'p1', 'enabled': True}]
+        self.config.profiles[SettingConfigSection.SETTINGS_KEY] = {'p1': {'plugin.test-rd2/opt': 'plug_profile'}}
+
+        class PlugPage2(OptionsPage):
+            NAME = 'test_rd_plug2_page'
+            TITLE = 'Plugin'
+            PARENT = None
+            SORT_ORDER = 9999
+            OPTION_SECTION = 'plugin.test-rd2'
+            OPTIONS: ClassVar[PageOptionConfigs] = {'opt': {}}
+
+        from picard.extension_points.options_pages import register_options_page
+
+        register_options_page(PlugPage2)
+
+        class FakeApi:
+            plugin_config = section
+
+        page = PlugPage2.__new__(PlugPage2)
+        page.api = FakeApi()
+        page.load = lambda: None
+
+        page.restore_defaults()
+
+        # Profile value restored (not persisted as default)
+        self.assertEqual(section['opt'], 'plug_profile')
+        # Base value untouched
+        with self.config.setting.no_profile():
+            self.assertEqual(section['opt'], 'plug_base')
+
+
+class TestObsoleteOptionsCleanup(TestPicardConfigCommon):
+    """Removal of options declared via obsolete_options.
+
+    The purge runs once from run_upgrade_hooks() after all upgrade hooks have
+    completed (not from sync()), so tests either call _remove_obsolete_options()
+    directly or drive it through run_upgrade_hooks().
+    """
+
+    ENTRY = ('setting', 'dev_only_option', Version(3, 0, 0, 'b', 8))
+
+    def _purge_with_registry(self, entries):
+        with mock.patch.object(config, '_OBSOLETE_OPTIONS', list(entries)):
+            self.config._remove_obsolete_options()
+
+    def test_removed_when_original_version_older(self):
+        # Original version predates obsoleted_in -> purge.
+        self.config._original_version = Version(2, 0, 0)
+        self.config.setValue('setting/dev_only_option', 'stale')
+        self._purge_with_registry([self.ENTRY])
+        self.assertFalse(self.config.contains('setting/dev_only_option'))
+
+    def test_plain_sync_does_not_purge(self):
+        # The purge is wired to run_upgrade_hooks(), not sync(): a plain sync()
+        # (as happens repeatedly at runtime) must never drop an obsolete key.
+        self.config._original_version = Version(2, 0, 0)
+        self.config.setValue('setting/dev_only_option', 'stale')
+        with mock.patch.object(config, '_OBSOLETE_OPTIONS', [self.ENTRY]):
+            self.config.sync()
+        self.assertTrue(self.config.contains('setting/dev_only_option'))
+
+    def test_only_listed_keys_removed(self):
+        # Absent keys are a no-op; similarly-named/unlisted keys are preserved.
+        self.config._original_version = Version(2, 0, 0)
+        self.config.setValue('setting/dev_only_option', 'x')
+        self.config.setValue('setting/dev_only_option_plugin', 'keep')
+        self.config.setValue('persist/window_geometry', 'keep')
+        self._purge_with_registry([self.ENTRY, ('setting', 'absent', Version(3, 0, 0))])
+        self.assertFalse(self.config.contains('setting/dev_only_option'))
+        self.assertTrue(self.config.contains('setting/dev_only_option_plugin'))
+        self.assertTrue(self.config.contains('persist/window_geometry'))
+
+    @subtest_cases(
+        "original_version,expected_removed",
+        {
+            'older than obsoleted_in -> remove': (Version(3, 0, 0, 'b', 7), True),
+            'equal to obsoleted_in -> keep': (Version(3, 0, 0, 'b', 8), False),
+            'newer than obsoleted_in -> keep': (Version(3, 1, 0), False),
+        },
+    )
+    def test_version_guard(self, original_version, expected_removed):
+        self.config._original_version = original_version
+        self.config.setValue('setting/dev_only_option', 'value')
+        self._purge_with_registry([self.ENTRY])
+        self.assertEqual(not self.config.contains('setting/dev_only_option'), expected_removed)
+
+    def test_version_guard_uses_original_not_upgraded_version(self):
+        # Upgrade hooks advance _version; the guard must use the original.
+        self.config._original_version = Version(2, 0, 0)
+        self.config._version = PICARD_VERSION  # as an upgrade pass would leave it
+        self.config.setValue('setting/dev_only_option', 'stale')
+        self._purge_with_registry([self.ENTRY])
+        self.assertFalse(self.config.contains('setting/dev_only_option'))
+
+    def test_purged_when_obsoleted_version_is_skipped(self):
+        # The purge is decoupled from upgrade hooks: an option obsoleted in a
+        # version that has NO hook and is never a step in the migration (here
+        # b8, while the config jumps b7 -> b9) is still purged, because the
+        # guard is a plain original_version < obsoleted_in comparison.
+        entry = ('setting', 'dev_only_option', Version(3, 0, 0, 'b', 8))
+        self.config._original_version = Version(3, 0, 0, 'b', 7)
+        self.config._version = Version(3, 0, 0, 'b', 7)
+        self.config.setValue('setting/dev_only_option', 'stale')
+        ran = []
+        # Only a b9 hook exists; nothing at b8 (the obsoleted-in version).
+        hooks = {Version(3, 0, 0, 'b', 9): lambda _c: ran.append('b9')}
+        with mock.patch.object(config, '_OBSOLETE_OPTIONS', [entry]):
+            self.config.run_upgrade_hooks(hooks)
+        self.assertEqual(ran, ['b9'])  # b8 was never a migration step
+        self.assertFalse(self.config.contains('setting/dev_only_option'))
+
+    def test_option_survives_until_converter_runs_then_purged_once(self):
+        # A to-be-converted option must still be present when its converter
+        # (here b8) runs, and be purged exactly once after the whole upgrade
+        # loop. Because the purge is wired to run_upgrade_hooks() (not sync()),
+        # the per-hook syncs inside the loop cannot drop it early.
+        self.config._original_version = Version(3, 0, 0, 'b', 6)
+        self.config._version = Version(3, 0, 0, 'b', 6)
+        self.config.setValue('setting/dev_only_option', 'stale')
+        seen = {}
+        hooks = {
+            Version(3, 0, 0, 'b', 7): lambda c: seen.__setitem__('b7', c.contains('setting/dev_only_option')),
+            Version(3, 0, 0, 'b', 8): lambda c: seen.__setitem__('b8', c.contains('setting/dev_only_option')),
+        }
+        with mock.patch.object(config, '_OBSOLETE_OPTIONS', [self.ENTRY]):
+            self.config.run_upgrade_hooks(hooks)
+        self.assertTrue(seen.get('b7'))
+        self.assertTrue(seen.get('b8'))
+        self.assertFalse(self.config.contains('setting/dev_only_option'))
+
+    def test_not_purged_on_partial_migration(self):
+        # Partial migration: an earlier hook (b7) succeeds and bumps the
+        # version, a later hook (b8, the converter for the obsolete option)
+        # raises. run_upgrade_hooks() re-raises before the purge, so the
+        # to-be-converted option must survive for a later, complete run.
+        self.config._original_version = Version(3, 0, 0, 'b', 6)
+        self.config._version = Version(3, 0, 0, 'b', 6)
+        self.config.setValue('setting/dev_only_option', 'stale')
+        ran = []
+
+        def ok(_c):
+            ran.append('b7')
+
+        def boom(_c):
+            raise RuntimeError("converter failure")
+
+        hooks = {
+            Version(3, 0, 0, 'b', 7): ok,
+            Version(3, 0, 0, 'b', 8): boom,
+        }
+        with mock.patch.object(config, '_OBSOLETE_OPTIONS', [self.ENTRY]):
+            with self.assertRaises(ConfigUpgradeError):
+                self.config.run_upgrade_hooks(hooks)
+        self.assertEqual(ran, ['b7'])  # first hook did run and bump the version
+        self.assertGreaterEqual(self.config._version, Version(3, 0, 0, 'b', 7))
+        self.assertTrue(self.config.contains('setting/dev_only_option'))
+
+    def test_registered_option_is_kept_and_warns(self):
+        # A live registered Option with the same name must never be purged.
+        self.config._original_version = Version(2, 0, 0)
+        self.config.setValue('setting/dev_only_option', 'live-value')
+        TextOption('setting', 'dev_only_option', 'default')
+        with (
+            mock.patch.object(config, '_OBSOLETE_OPTIONS', [self.ENTRY]),
+            mock.patch.object(config.log, 'warning') as mock_warning,
+        ):
+            self.config._remove_obsolete_options()
+        self.assertEqual(self.config.value('setting/dev_only_option'), 'live-value')
+        mock_warning.assert_called_once()
+
+    def test_declared_registry_is_valid(self):
+        # The real obsolete_options() declarations (populated by importing
+        # config_upgrade_hooks above) must include the expected entries and
+        # never name a live registered option (which would silently prevent
+        # purging). self.old_registry holds the real registry saved by setUp.
+        entries = {(s, n): v for s, n, v in config._OBSOLETE_OPTIONS}
+        self.assertEqual(entries.get(('setting', 'release_type_scores')), Version(3, 0, 0, 'b', 8))
+        self.assertEqual(entries.get(('setting', 'rating_steps')), Version(3, 0, 0, 'rc', 4))
+        self.assertGreater(len(self.old_registry), 100)  # guard against vacuous pass
+        collisions = [(s, n) for (s, n) in entries if (s, n) in self.old_registry]
+        self.assertEqual(collisions, [], msg="obsolete_options names a live option: %s" % collisions)
+
+    def test_obsolete_options_helper_appends_with_version(self):
+        with mock.patch.object(config, '_OBSOLETE_OPTIONS', []):
+            config.obsolete_options('3.0.0b8', ('setting', 'foo'), ('persist', 'bar'))
+            self.assertEqual(
+                config._OBSOLETE_OPTIONS,
+                [
+                    ('setting', 'foo', Version(3, 0, 0, 'b', 8)),
+                    ('persist', 'bar', Version(3, 0, 0, 'b', 8)),
+                ],
+            )
